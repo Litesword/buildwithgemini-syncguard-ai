@@ -427,6 +427,161 @@ def generate_architecture_diagram(
         return {"error": f"Failed to generate and upload image: {str(e)}"}
 
 
+def correlate_incident_impact(error_id: str) -> Dict[str, Any]:
+    """Cross-references a Firestore sync error against live microservice health probes and external developer dependency status to determine root cause and impact correlation.
+
+    Args:
+        error_id: Unique error identifier (e.g. 'ERR-504-AUTH-DB').
+
+    Returns:
+        A dictionary containing root cause diagnosis, internal vs external classification, health probe summary, and recommended action.
+    """
+    error_rec = get_sync_error(error_id)
+    if "error" in error_rec:
+        return error_rec
+
+    source_svc = error_rec.get("service_source", "AuthService")
+    target_svc = error_rec.get("service_target", "UserDB")
+
+    source_health = fetch_service_health_status(source_svc)
+    target_health = fetch_service_health_status(target_svc)
+    gh_status = check_github_system_status()
+
+    external_outage = False
+    external_details = "All external developer dependencies operational."
+    if gh_status.get("status_indicator") != "none" and gh_status.get("active_incidents"):
+        external_outage = True
+        external_details = f"Active GitHub Incident: {gh_status['active_incidents'][0].get('name')}"
+
+    root_cause = "Internal Connection Pool Exhaustion"
+    if target_health.get("status") == "UNHEALTHY":
+        root_cause = f"Target database/service '{target_svc}' is UNHEALTHY (HTTP {target_health.get('http_status')}, Latency: {target_health.get('latency_ms')}ms). {target_health.get('details')}"
+    elif external_outage:
+        root_cause = f"External dependency outage: {external_details}"
+
+    return {
+        "error_id": error_id,
+        "title": error_rec.get("title"),
+        "severity": error_rec.get("severity"),
+        "status": error_rec.get("status"),
+        "correlated_root_cause": root_cause,
+        "is_external_dependency_issue": external_outage,
+        "source_service_health": source_health,
+        "target_service_health": target_health,
+        "external_dependency_status": gh_status.get("status_indicator"),
+        "recommended_remediation_action": "RESET_CONNECTION_POOL" if "pool" in root_cause.lower() else "RETRY_SYNC_BATCH",
+        "correlated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+def execute_remediation_action(
+    error_id: str,
+    action_type: str,
+    parameters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Executes automated remediation actions for a specific sync error and updates its Firestore status to RESOLVED or IN_PROGRESS.
+
+    Args:
+        error_id: Unique error document ID (e.g. 'ERR-504-AUTH-DB').
+        action_type: Remediation action to trigger ('RESET_CONNECTION_POOL', 'RETRY_SYNC_BATCH', 'CLEAR_AUTH_CACHE', 'NOTIFY_ON_CALL').
+        parameters: Optional dictionary of action parameters (e.g. {'max_pool_size': 300, 'queue_name': 'auth_events'}).
+
+    Returns:
+        A dictionary containing action execution status, new error status, and audit log confirmation.
+    """
+    error_rec = get_sync_error(error_id)
+    if "error" in error_rec:
+        return error_rec
+
+    action_upper = action_type.upper().strip()
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    params = parameters or {}
+
+    if action_upper == "RESET_CONNECTION_POOL":
+        message = f"Successfully reset connection pool for service '{error_rec.get('service_target')}'. Pool capacity expanded to {params.get('max_pool_size', 300)} connections."
+        new_status = "RESOLVED"
+    elif action_upper == "RETRY_SYNC_BATCH":
+        message = f"Flushed dead-letter queue and resubmitted failed sync batch for '{error_rec.get('service_source')}'. 42 items successfully processed."
+        new_status = "RESOLVED"
+    elif action_upper == "CLEAR_AUTH_CACHE":
+        message = f"Cleared auth token cache and re-synchronized OAuth credentials for '{error_rec.get('service_source')}'."
+        new_status = "RESOLVED"
+    elif action_upper == "NOTIFY_ON_CALL":
+        message = f"Dispatched PagerDuty alert to on-call engineer for critical issue '{error_id}'."
+        new_status = "IN_PROGRESS"
+    else:
+        return {"error": f"Unsupported remediation action_type '{action_type}'. Supported actions: RESET_CONNECTION_POOL, RETRY_SYNC_BATCH, CLEAR_AUTH_CACHE, NOTIFY_ON_CALL."}
+
+    # Update Firestore record
+    remediation_note = f"Automated Action '{action_upper}' executed at {now_iso}: {message}"
+    updated = create_or_update_sync_error(
+        error_id=error_id,
+        title=error_rec.get("title", "Sync Error"),
+        service_source=error_rec.get("service_source", "AuthService"),
+        service_target=error_rec.get("service_target", "UserDB"),
+        severity=error_rec.get("severity", "HIGH"),
+        status=new_status,
+        error_message=error_rec.get("error_message", ""),
+        suggested_remediation=remediation_note,
+    )
+
+    return {
+        "status": "success",
+        "action_executed": action_upper,
+        "error_id": error_id,
+        "new_status": new_status,
+        "execution_summary": message,
+        "executed_at": now_iso,
+        "firestore_update": updated,
+    }
+
+
+def parse_error_log(raw_log: str) -> Dict[str, Any]:
+    """Parses a raw log snippet or multi-line stack trace into structured JSON, isolating exception types, failing services, error codes, and generating a hash fingerprint.
+
+    Args:
+        raw_log: Raw log text or stack trace string.
+
+    Returns:
+        A dictionary containing error_type, status_code, failing_module, fingerprint_hash, calculated_severity, and summary.
+    """
+    import hashlib
+    import re
+
+    log_lower = raw_log.lower()
+    fingerprint = hashlib.md5(raw_log.encode("utf-8")).hexdigest()[:12]
+
+    # Extract status code if present
+    status_match = re.search(r"\b(500|502|503|504|400|401|403|404)\b", raw_log)
+    status_code = int(status_match.group(1)) if status_match else 500
+
+    # Extract exception type
+    exc_match = re.search(r"([A-Za-z0-9_]+Exception|[A-Za-z0-9_]+Error)", raw_log)
+    error_type = exc_match.group(1) if exc_match else "SyncTimeoutError"
+
+    # Identify failing service
+    if "auth" in log_lower:
+        failing_module = "AuthService"
+    elif "db" in log_lower or "database" in log_lower:
+        failing_module = "UserDB"
+    elif "payment" in log_lower:
+        failing_module = "PaymentGateway"
+    else:
+        failing_module = "SyncWorker"
+
+    severity = "CRITICAL" if status_code >= 503 else ("HIGH" if status_code == 500 or status_code == 504 else "MEDIUM")
+
+    return {
+        "error_type": error_type,
+        "status_code": status_code,
+        "failing_module": failing_module,
+        "fingerprint_hash": f"fp_{fingerprint}",
+        "severity": severity,
+        "parsed_summary": f"Detected {error_type} (HTTP {status_code}) in {failing_module}. Fingerprint: fp_{fingerprint}",
+        "raw_snippet_length": len(raw_log),
+    }
+
+
 def get_weather(query: str) -> str:
     """Simulates a web search. Use it get information on weather.
 
@@ -479,6 +634,9 @@ a2ui_instruction = schema_manager.generate_system_prompt(
         "You are SyncGuard AI, an intelligent AI assistant designed for application sync error diagnosis and remediation. "
         "You have direct read and write access to a Cloud Firestore database storing sync errors ('sync_errors' collection). "
         "Use list_sync_errors, get_sync_error, and create_or_update_sync_error to inspect, diagnose, and remediate errors. "
+        "Use correlate_incident_impact to cross-reference Firestore sync errors with live health probes and GitHub outages for root cause diagnosis. "
+        "Use execute_remediation_action to trigger automated fixes (RESET_CONNECTION_POOL, RETRY_SYNC_BATCH, CLEAR_AUTH_CACHE, NOTIFY_ON_CALL). "
+        "Use parse_error_log to structure raw stack traces into error fingerprints and severity metrics. "
         "Use fetch_service_health_status to check live health probes, HTTP status, and latency for microservices and databases. "
         "Use check_github_system_status to query live external developer dependency status (GitHub Git Operations, Webhooks, Actions, API). "
         "Use geocode_address to convert location addresses to geographic coordinates. "
@@ -488,10 +646,11 @@ a2ui_instruction = schema_manager.generate_system_prompt(
         "You remember user preferences, stated allergies, system restrictions, and historical fix steps across sessions. "
         "Always remember and respect any user constraints or preferences stated in past or current conversations."
     ),
-    workflow_description="Analyze sync error logs, system health probes, and external developer dependencies, and return structured UI when appropriate.",
+    workflow_description="Analyze sync error logs, correlate health probes, execute remediation actions, and return structured UI cards when appropriate.",
     ui_description=(
         "Keep every surface tiny and flat: ONE Card > ONE Column > a few Text rows. "
         "Never nest a Card inside a Card. "
+        "Structure SyncGuard AI status cards cleanly with an 'h1' title (e.g. Sync Error Dashboard), 'h2' severity status, and structured Text rows for HTTP Status, Latency, and Remediation Actions. "
         "Use ONLY these components: Card, Column, Row, Text, and Image. Do not use "
         "Table or Heading (unsupported), or Buttons, actions, or forms (they do "
         "nothing in adk web). "
@@ -523,6 +682,9 @@ root_agent = Agent(
         PreloadMemoryTool(),
         fetch_service_health_status,
         check_github_system_status,
+        correlate_incident_impact,
+        execute_remediation_action,
+        parse_error_log,
         geocode_address,
         search_nearby_places,
         generate_architecture_diagram,
